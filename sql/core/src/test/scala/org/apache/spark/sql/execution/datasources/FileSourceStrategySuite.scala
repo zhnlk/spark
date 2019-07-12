@@ -25,7 +25,7 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{BlockLocation, FileStatus, Path, RawLocalFileSystem}
 import org.apache.hadoop.mapreduce.Job
 
-import org.apache.spark.{SparkConf, SparkException}
+import org.apache.spark.SparkException
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
@@ -201,7 +201,7 @@ class FileSourceStrategySuite extends QueryTest with SharedSQLContext with Predi
   }
 
   test("partitioned table - case insensitive") {
-    withSQLConf("spark.sql.caseSensitive" -> "false") {
+    withSQLConf(SQLConf.CASE_SENSITIVE.key -> "false") {
       val table =
         createTable(
           files = Seq(
@@ -244,7 +244,7 @@ class FileSourceStrategySuite extends QueryTest with SharedSQLContext with Predi
     val df2 = table.where("(p1 + c2) = 2 AND c1 = 1")
     // Filter on data only are advisory so we have to reevaluate.
     assert(getPhysicalFilters(df2) contains resolve(df2, "c1 = 1"))
-    // Need to evalaute filters that are not pushed down.
+    // Need to evaluate filters that are not pushed down.
     assert(getPhysicalFilters(df2) contains resolve(df2, "(p1 + c2) = 2"))
   }
 
@@ -279,7 +279,7 @@ class FileSourceStrategySuite extends QueryTest with SharedSQLContext with Predi
   }
 
   test("Locality support for FileScanRDD") {
-    val partition = FilePartition(0, Seq(
+    val partition = FilePartition(0, Array(
       PartitionedFile(InternalRow.empty, "fakePath0", 0, 10, Array("host0", "host1")),
       PartitionedFile(InternalRow.empty, "fakePath0", 10, 20, Array("host1", "host2")),
       PartitionedFile(InternalRow.empty, "fakePath1", 0, 5, Array("host3")),
@@ -401,7 +401,7 @@ class FileSourceStrategySuite extends QueryTest with SharedSQLContext with Predi
           sparkSession = spark,
           rootPathsSpecified = Seq(new Path(tempDir)),
           parameters = Map.empty[String, String],
-          partitionSchema = None)
+          userSpecifiedSchema = None)
         // This should not fail.
         fileCatalog.listLeafFiles(Seq(new Path(tempDir)))
 
@@ -414,24 +414,30 @@ class FileSourceStrategySuite extends QueryTest with SharedSQLContext with Predi
   }
 
   test("[SPARK-16818] partition pruned file scans implement sameResult correctly") {
-    withTempPath { path =>
-      val tempDir = path.getCanonicalPath
-      spark.range(100)
-        .selectExpr("id", "id as b")
-        .write
-        .partitionBy("id")
-        .parquet(tempDir)
-      val df = spark.read.parquet(tempDir)
-      def getPlan(df: DataFrame): SparkPlan = {
-        df.queryExecution.executedPlan
+    Seq("orc", "").foreach { useV1ReaderList =>
+      withSQLConf(SQLConf.USE_V1_SOURCE_READER_LIST.key -> useV1ReaderList) {
+        withTempPath { path =>
+          val tempDir = path.getCanonicalPath
+          spark.range(100)
+            .selectExpr("id", "id as b")
+            .write
+            .partitionBy("id")
+            .orc(tempDir)
+          val df = spark.read.orc(tempDir)
+
+          def getPlan(df: DataFrame): SparkPlan = {
+            df.queryExecution.executedPlan
+          }
+
+          assert(getPlan(df.where("id = 2")).sameResult(getPlan(df.where("id = 2"))))
+          assert(!getPlan(df.where("id = 2")).sameResult(getPlan(df.where("id = 3"))))
+        }
       }
-      assert(getPlan(df.where("id = 2")).sameResult(getPlan(df.where("id = 2"))))
-      assert(!getPlan(df.where("id = 2")).sameResult(getPlan(df.where("id = 3"))))
     }
   }
 
   test("[SPARK-16818] exchange reuse respects differences in partition pruning") {
-    spark.conf.set("spark.sql.exchange.reuse", true)
+    spark.conf.set(SQLConf.EXCHANGE_REUSE_ENABLED.key, true)
     withTempPath { path =>
       val tempDir = path.getCanonicalPath
       spark.range(10)
@@ -556,7 +562,7 @@ class FileSourceStrategySuite extends QueryTest with SharedSQLContext with Predi
 
     if (buckets > 0) {
       val bucketed = df.queryExecution.analyzed transform {
-        case l @ LogicalRelation(r: HadoopFsRelation, _, _) =>
+        case l @ LogicalRelation(r: HadoopFsRelation, _, _, _) =>
           l.copy(relation =
             r.copy(bucketSpec =
               Some(BucketSpec(numBuckets = buckets, "c1" :: Nil, Nil)))(r.sparkSession))
@@ -614,7 +620,7 @@ class TestFileFormat extends TextBasedFileFormat {
       job: Job,
       options: Map[String, String],
       dataSchema: StructType): OutputWriterFactory = {
-    throw new NotImplementedError("JUST FOR TESTING")
+    throw new UnsupportedOperationException("JUST FOR TESTING")
   }
 
   override def buildReader(

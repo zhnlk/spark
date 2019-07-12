@@ -17,10 +17,14 @@
 
 package org.apache.spark.sql.execution.streaming.state
 
+import java.util.UUID
+
 import scala.reflect.ClassTag
 
 import org.apache.spark.{Partition, TaskContext}
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.execution.streaming.StreamExecution
+import org.apache.spark.sql.execution.streaming.continuous.EpochTracker
 import org.apache.spark.sql.internal.SessionState
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.SerializableConfiguration
@@ -34,8 +38,8 @@ class StateStoreRDD[T: ClassTag, U: ClassTag](
     dataRDD: RDD[T],
     storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U],
     checkpointLocation: String,
+    queryRunId: UUID,
     operatorId: Long,
-    storeName: String,
     storeVersion: Long,
     keySchema: StructType,
     valueSchema: StructType,
@@ -52,16 +56,37 @@ class StateStoreRDD[T: ClassTag, U: ClassTag](
 
   override protected def getPartitions: Array[Partition] = dataRDD.partitions
 
+  /**
+   * Set the preferred location of each partition using the executor that has the related
+   * [[StateStoreProvider]] already loaded.
+   */
   override def getPreferredLocations(partition: Partition): Seq[String] = {
-    val storeId = StateStoreId(checkpointLocation, operatorId, partition.index, storeName)
-    storeCoordinator.flatMap(_.getLocation(storeId)).toSeq
+    val stateStoreProviderId = StateStoreProviderId(
+      StateStoreId(checkpointLocation, operatorId, partition.index),
+      queryRunId)
+    storeCoordinator.flatMap(_.getLocation(stateStoreProviderId)).toSeq
   }
 
   override def compute(partition: Partition, ctxt: TaskContext): Iterator[U] = {
     var store: StateStore = null
-    val storeId = StateStoreId(checkpointLocation, operatorId, partition.index, storeName)
+    val storeProviderId = StateStoreProviderId(
+      StateStoreId(checkpointLocation, operatorId, partition.index),
+      queryRunId)
+
+    // If we're in continuous processing mode, we should get the store version for the current
+    // epoch rather than the one at planning time.
+    val isContinuous = Option(ctxt.getLocalProperty(StreamExecution.IS_CONTINUOUS_PROCESSING))
+      .map(_.toBoolean).getOrElse(false)
+    val currentVersion = if (isContinuous) {
+      val epoch = EpochTracker.getCurrentEpoch
+      assert(epoch.isDefined, "Current epoch must be defined for continuous processing streams.")
+      epoch.get
+    } else {
+      storeVersion
+    }
+
     store = StateStore.get(
-      storeId, keySchema, valueSchema, indexOrdinal, storeVersion,
+      storeProviderId, keySchema, valueSchema, indexOrdinal, currentVersion,
       storeConf, hadoopConfBroadcast.value.value)
     val inputIter = dataRDD.iterator(partition, ctxt)
     storeUpdateFunction(store, inputIter)

@@ -17,12 +17,17 @@
 
 package org.apache.spark.network.shuffle;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
 
+import com.codahale.metrics.MetricSet;
 import com.google.common.collect.Lists;
+import org.apache.spark.network.client.RpcResponseCallback;
+import org.apache.spark.network.shuffle.protocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,8 +38,6 @@ import org.apache.spark.network.client.TransportClientFactory;
 import org.apache.spark.network.crypto.AuthClientBootstrap;
 import org.apache.spark.network.sasl.SecretKeyHolder;
 import org.apache.spark.network.server.NoOpRpcHandler;
-import org.apache.spark.network.shuffle.protocol.ExecutorShuffleInfo;
-import org.apache.spark.network.shuffle.protocol.RegisterExecutor;
 import org.apache.spark.network.util.TransportConf;
 
 /**
@@ -49,6 +52,7 @@ public class ExternalShuffleClient extends ShuffleClient {
   private final TransportConf conf;
   private final boolean authEnabled;
   private final SecretKeyHolder secretKeyHolder;
+  private final long registrationTimeoutMs;
 
   protected TransportClientFactory clientFactory;
   protected String appId;
@@ -60,20 +64,25 @@ public class ExternalShuffleClient extends ShuffleClient {
   public ExternalShuffleClient(
       TransportConf conf,
       SecretKeyHolder secretKeyHolder,
-      boolean authEnabled) {
+      boolean authEnabled,
+      long registrationTimeoutMs) {
     this.conf = conf;
     this.secretKeyHolder = secretKeyHolder;
     this.authEnabled = authEnabled;
+    this.registrationTimeoutMs = registrationTimeoutMs;
   }
 
   protected void checkInit() {
     assert appId != null : "Called before init()";
   }
 
-  @Override
+  /**
+   * Initializes the ShuffleClient, specifying this Executor's appId.
+   * Must be called before any other method on the ShuffleClient.
+   */
   public void init(String appId) {
     this.appId = appId;
-    TransportContext context = new TransportContext(conf, new NoOpRpcHandler(), true);
+    TransportContext context = new TransportContext(conf, new NoOpRpcHandler(), true, true);
     List<TransportClientBootstrap> bootstraps = Lists.newArrayList();
     if (authEnabled) {
       bootstraps.add(new AuthClientBootstrap(conf, appId, secretKeyHolder));
@@ -88,15 +97,15 @@ public class ExternalShuffleClient extends ShuffleClient {
       String execId,
       String[] blockIds,
       BlockFetchingListener listener,
-      File[] shuffleFiles) {
+      DownloadFileManager downloadFileManager) {
     checkInit();
     logger.debug("External shuffle fetch from {}:{} (executor id {})", host, port, execId);
     try {
       RetryingBlockFetcher.BlockFetchStarter blockFetchStarter =
           (blockIds1, listener1) -> {
             TransportClient client = clientFactory.createClient(host, port);
-            new OneForOneBlockFetcher(client, appId, execId, blockIds1, listener1, conf,
-              shuffleFiles).start();
+            new OneForOneBlockFetcher(client, appId, execId,
+              blockIds1, listener1, conf, downloadFileManager).start();
           };
 
       int maxRetries = conf.maxIORetries();
@@ -115,6 +124,12 @@ public class ExternalShuffleClient extends ShuffleClient {
     }
   }
 
+  @Override
+  public MetricSet shuffleMetrics() {
+    checkInit();
+    return clientFactory.getAllMetrics();
+  }
+
   /**
    * Registers this executor with an external shuffle server. This registration is required to
    * inform the shuffle server about where and how we store our shuffle files.
@@ -130,14 +145,53 @@ public class ExternalShuffleClient extends ShuffleClient {
       String execId,
       ExecutorShuffleInfo executorInfo) throws IOException, InterruptedException {
     checkInit();
-    try (TransportClient client = clientFactory.createUnmanagedClient(host, port)) {
+    try (TransportClient client = clientFactory.createClient(host, port)) {
       ByteBuffer registerMessage = new RegisterExecutor(appId, execId, executorInfo).toByteBuffer();
-      client.sendRpcSync(registerMessage, 5000 /* timeoutMs */);
+      client.sendRpcSync(registerMessage, registrationTimeoutMs);
     }
+  }
+
+  public Future<Integer> removeBlocks(
+      String host,
+      int port,
+      String execId,
+      String[] blockIds) throws IOException, InterruptedException {
+    checkInit();
+    CompletableFuture<Integer> numRemovedBlocksFuture = new CompletableFuture<>();
+    ByteBuffer removeBlocksMessage = new RemoveBlocks(appId, execId, blockIds).toByteBuffer();
+    final TransportClient client = clientFactory.createClient(host, port);
+    client.sendRpc(removeBlocksMessage, new RpcResponseCallback() {
+      @Override
+      public void onSuccess(ByteBuffer response) {
+        try {
+          BlockTransferMessage msgObj = BlockTransferMessage.Decoder.fromByteBuffer(response);
+          numRemovedBlocksFuture.complete(((BlocksRemoved) msgObj).numRemovedBlocks);
+        } catch (Throwable t) {
+          logger.warn("Error trying to remove RDD blocks " + Arrays.toString(blockIds) +
+            " via external shuffle service from executor: " + execId, t);
+          numRemovedBlocksFuture.complete(0);
+        } finally {
+          client.close();
+        }
+      }
+
+      @Override
+      public void onFailure(Throwable e) {
+        logger.warn("Error trying to remove RDD blocks " + Arrays.toString(blockIds) +
+            " via external shuffle service from executor: " + execId, e);
+        numRemovedBlocksFuture.complete(0);
+        client.close();
+      }
+    });
+    return numRemovedBlocksFuture;
   }
 
   @Override
   public void close() {
-    clientFactory.close();
+    checkInit();
+    if (clientFactory != null) {
+      clientFactory.close();
+      clientFactory = null;
+    }
   }
 }

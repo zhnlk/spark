@@ -21,7 +21,7 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.annotation.Since
 import org.apache.spark.ml._
-import org.apache.spark.ml.linalg.{Vector, VectorUDT}
+import org.apache.spark.ml.linalg._
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
@@ -162,11 +162,34 @@ class StandardScalerModel private[ml] (
     transformSchema(dataset.schema, logging = true)
     val scaler = new feature.StandardScalerModel(std, mean, $(withStd), $(withMean))
 
-    // TODO: Make the transformer natively in ml framework to avoid extra conversion.
-    val transformer: Vector => Vector = v => scaler.transform(OldVectors.fromML(v)).asML
+    val func = if ($(withMean)) {
+      vector: Vector =>
+        val values = vector match {
+          // specially handle DenseVector because its toArray does not clone already
+          case d: DenseVector => d.values.clone()
+          case v: Vector => v.toArray
+        }
+        val newValues = scaler.transfromWithMean(values)
+        Vectors.dense(newValues)
+    } else if ($(withStd)) {
+      vector: Vector =>
+        vector match {
+          case DenseVector(values) =>
+            val newValues = scaler.transformDenseWithStd(values)
+            Vectors.dense(newValues)
+          case SparseVector(size, indices, values) =>
+            val (newIndices, newValues) = scaler.transformSparseWithStd(indices, values)
+            Vectors.sparse(size, newIndices, newValues)
+          case other =>
+            throw new UnsupportedOperationException(
+              s"Only sparse and dense vectors are supported but got ${other.getClass}.")
+        }
+    } else {
+      vector: Vector => vector
+    }
 
-    val scale = udf(transformer)
-    dataset.withColumn($(outputCol), scale(col($(inputCol))))
+    val transformer = udf(func)
+    dataset.withColumn($(outputCol), transformer(col($(inputCol))))
   }
 
   @Since("1.4.0")
@@ -212,7 +235,7 @@ object StandardScalerModel extends MLReadable[StandardScalerModel] {
         .select("std", "mean")
         .head()
       val model = new StandardScalerModel(metadata.uid, std, mean)
-      DefaultParamsReader.getAndSetParams(model, metadata)
+      metadata.getAndSetParams(model)
       model
     }
   }

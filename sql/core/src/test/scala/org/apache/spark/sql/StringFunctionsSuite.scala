@@ -129,6 +129,18 @@ class StringFunctionsSuite extends QueryTest with SharedSQLContext {
       Row("AQIDBA==", bytes))
   }
 
+  test("overlay function") {
+    // scalastyle:off
+    // non ascii characters are not allowed in the code, so we disable the scalastyle here.
+    val df = Seq(("Spark SQL", "Spark的SQL")).toDF("a", "b")
+    checkAnswer(df.select(overlay($"a", "_", 6)), Row("Spark_SQL"))
+    checkAnswer(df.select(overlay($"a", "CORE", 7)), Row("Spark CORE"))
+    checkAnswer(df.select(overlay($"a", "ANSI ", 7, 0)), Row("Spark ANSI SQL"))
+    checkAnswer(df.select(overlay($"a", "tructured", 2, 4)), Row("Structured SQL"))
+    checkAnswer(df.select(overlay($"b", "_", 6)), Row("Spark_SQL"))
+    // scalastyle:on
+  }
+
   test("string / binary substring function") {
     // scalastyle:off
     // non ascii characters are not allowed in the code, so we disable the scalastyle here.
@@ -161,11 +173,23 @@ class StringFunctionsSuite extends QueryTest with SharedSQLContext {
   }
 
   test("string trim functions") {
-    val df = Seq(("  example  ", "")).toDF("a", "b")
+    val df = Seq(("  example  ", "", "example")).toDF("a", "b", "c")
 
     checkAnswer(
       df.select(ltrim($"a"), rtrim($"a"), trim($"a")),
       Row("example  ", "  example", "example"))
+
+    checkAnswer(
+      df.select(ltrim($"c", "e"), rtrim($"c", "e"), trim($"c", "e")),
+      Row("xample", "exampl", "xampl"))
+
+    checkAnswer(
+      df.select(ltrim($"c", "xe"), rtrim($"c", "emlp"), trim($"c", "elxp")),
+      Row("ample", "exa", "am"))
+
+    checkAnswer(
+      df.select(trim($"c", "xyz")),
+      Row("example"))
 
     checkAnswer(
       df.selectExpr("ltrim(a)", "rtrim(a)", "trim(a)"),
@@ -317,16 +341,52 @@ class StringFunctionsSuite extends QueryTest with SharedSQLContext {
       Row("   "))
   }
 
-  test("string split function") {
-    val df = Seq(("aa2bb3cc", "[1-9]+")).toDF("a", "b")
+  test("string split function with no limit") {
+    val df = Seq(("aa2bb3cc4", "[1-9]+")).toDF("a", "b")
 
     checkAnswer(
       df.select(split($"a", "[1-9]+")),
-      Row(Seq("aa", "bb", "cc")))
+      Row(Seq("aa", "bb", "cc", "")))
 
     checkAnswer(
       df.selectExpr("split(a, '[1-9]+')"),
-      Row(Seq("aa", "bb", "cc")))
+      Row(Seq("aa", "bb", "cc", "")))
+  }
+
+  test("string split function with limit explicitly set to 0") {
+    val df = Seq(("aa2bb3cc4", "[1-9]+")).toDF("a", "b")
+
+    checkAnswer(
+      df.select(split($"a", "[1-9]+", 0)),
+      Row(Seq("aa", "bb", "cc", "")))
+
+    checkAnswer(
+      df.selectExpr("split(a, '[1-9]+', 0)"),
+      Row(Seq("aa", "bb", "cc", "")))
+  }
+
+  test("string split function with positive limit") {
+    val df = Seq(("aa2bb3cc4", "[1-9]+")).toDF("a", "b")
+
+    checkAnswer(
+      df.select(split($"a", "[1-9]+", 2)),
+      Row(Seq("aa", "bb3cc4")))
+
+    checkAnswer(
+      df.selectExpr("split(a, '[1-9]+', 2)"),
+      Row(Seq("aa", "bb3cc4")))
+  }
+
+  test("string split function with negative limit") {
+    val df = Seq(("aa2bb3cc4", "[1-9]+")).toDF("a", "b")
+
+    checkAnswer(
+      df.select(split($"a", "[1-9]+", -2)),
+      Row(Seq("aa", "bb", "cc", "")))
+
+    checkAnswer(
+      df.selectExpr("split(a, '[1-9]+', -2)"),
+      Row(Seq("aa", "bb", "cc", "")))
   }
 
   test("string / binary length function") {
@@ -387,7 +447,7 @@ class StringFunctionsSuite extends QueryTest with SharedSQLContext {
       Row("6.4817"))
 
     checkAnswer(
-      df.select(format_number(lit(BigDecimal(7.128381)), 4)), // not convert anything
+      df.select(format_number(lit(BigDecimal("7.128381")), 4)), // not convert anything
       Row("7.1284"))
 
     intercept[AnalysisException] {

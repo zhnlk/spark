@@ -17,19 +17,18 @@
 
 package org.apache.spark.scheduler.cluster.mesos
 
-import org.scalatest._
-import org.scalatest.mock.MockitoSugar
-
 import org.apache.spark.{SparkConf, SparkFunSuite}
+import org.apache.spark.deploy.mesos.config
 
 class MesosSchedulerBackendUtilSuite extends SparkFunSuite {
 
   test("ContainerInfo fails to parse invalid docker parameters") {
     val conf = new SparkConf()
-    conf.set("spark.mesos.executor.docker.parameters", "a,b")
-    conf.set("spark.mesos.executor.docker.image", "test")
+    conf.set(config.EXECUTOR_DOCKER_PARAMETERS, Seq("a", "b"))
+    conf.set(config.EXECUTOR_DOCKER_IMAGE, "test")
 
-    val containerInfo = MesosSchedulerBackendUtil.containerInfo(conf)
+    val containerInfo = MesosSchedulerBackendUtil.buildContainerInfo(
+      conf)
     val params = containerInfo.getDocker.getParametersList
 
     assert(params.size() == 0)
@@ -37,10 +36,11 @@ class MesosSchedulerBackendUtilSuite extends SparkFunSuite {
 
   test("ContainerInfo parses docker parameters") {
     val conf = new SparkConf()
-    conf.set("spark.mesos.executor.docker.parameters", "a=1,b=2,c=3")
-    conf.set("spark.mesos.executor.docker.image", "test")
+    conf.set(config.EXECUTOR_DOCKER_PARAMETERS, Seq("a=1", "b=2", "c=3"))
+    conf.set(config.EXECUTOR_DOCKER_IMAGE, "test")
 
-    val containerInfo = MesosSchedulerBackendUtil.containerInfo(conf)
+    val containerInfo = MesosSchedulerBackendUtil.buildContainerInfo(
+      conf)
     val params = containerInfo.getDocker.getParametersList
     assert(params.size() == 3)
     assert(params.get(0).getKey == "a")

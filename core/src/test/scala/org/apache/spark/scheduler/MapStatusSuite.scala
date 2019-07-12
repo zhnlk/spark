@@ -21,15 +21,17 @@ import java.io.{ByteArrayInputStream, ByteArrayOutputStream, ObjectInputStream, 
 
 import scala.util.Random
 
-import org.mockito.Mockito._
+import org.mockito.Mockito.mock
 import org.roaringbitmap.RoaringBitmap
 
-import org.apache.spark.{SparkConf, SparkEnv, SparkFunSuite}
+import org.apache.spark.{SparkConf, SparkContext, SparkEnv, SparkFunSuite}
+import org.apache.spark.LocalSparkContext._
 import org.apache.spark.internal.config
-import org.apache.spark.serializer.JavaSerializer
+import org.apache.spark.serializer.{JavaSerializer, KryoSerializer}
 import org.apache.spark.storage.BlockManagerId
 
 class MapStatusSuite extends SparkFunSuite {
+  private def doReturn(value: Any) = org.mockito.Mockito.doReturn(value, Seq.empty: _*)
 
   test("compressSize") {
     assert(MapStatus.compressSize(0L) === 0)
@@ -97,6 +99,28 @@ class MapStatusSuite extends SparkFunSuite {
     }
   }
 
+  test("SPARK-22540: ensure HighlyCompressedMapStatus calculates correct avgSize") {
+    val threshold = 1000
+    val conf = new SparkConf().set(config.SHUFFLE_ACCURATE_BLOCK_THRESHOLD.key, threshold.toString)
+    val env = mock(classOf[SparkEnv])
+    doReturn(conf).when(env).conf
+    SparkEnv.set(env)
+    val sizes = (0L to 3000L).toArray
+    val smallBlockSizes = sizes.filter(n => n > 0 && n < threshold)
+    val avg = smallBlockSizes.sum / smallBlockSizes.length
+    val loc = BlockManagerId("a", "b", 10)
+    val status = MapStatus(loc, sizes)
+    val status1 = compressAndDecompressMapStatus(status)
+    assert(status1.isInstanceOf[HighlyCompressedMapStatus])
+    assert(status1.location == loc)
+    for (i <- 0 until threshold) {
+      val estimate = status1.getSizeForBlock(i)
+      if (sizes(i) > 0) {
+        assert(estimate === avg)
+      }
+    }
+  }
+
   def compressAndDecompressMapStatus(status: MapStatus): MapStatus = {
     val ser = new JavaSerializer(new SparkConf)
     val buf = ser.newInstance().serialize(status)
@@ -152,6 +176,17 @@ class MapStatusSuite extends SparkFunSuite {
     val status2 = objectInput.readObject().asInstanceOf[HighlyCompressedMapStatus]
     (1001 to 2000).foreach {
       case part => assert(status2.getSizeForBlock(part) >= sizes(part))
+    }
+  }
+
+  test("SPARK-21133 HighlyCompressedMapStatus#writeExternal throws NPE") {
+    val conf = new SparkConf()
+      .set(config.SERIALIZER, classOf[KryoSerializer].getName)
+      .setMaster("local")
+      .setAppName("SPARK-21133")
+    withSpark(new SparkContext(conf)) { sc =>
+      val count = sc.parallelize(0 until 3000, 10).repartition(2001).collect().length
+      assert(count === 3000)
     }
   }
 }
